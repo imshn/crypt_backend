@@ -1,0 +1,25 @@
+# Example Render configuration.  You can either create services through the
+# dashboard or define them in a render.yaml file checked into your repository.
+# See https://render.com/docs/deploy-configuration for details.
+
+services:
+  - type: web
+    name: crpt-backend
+    env: docker         # use Dockerfile in repo
+    branch: main
+    dockerfilePath: Dockerfile
+    plan: starter
+    region: oregon
+    # startCommand can be omitted because CMD in Dockerfile handles it
+    # startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
+        fromSecret: NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
+      - key: COINGECKO_API_KEY
+        fromSecret: COINGECKO_API_KEY
+
+# A managed Postgres instance attached to the same repo
+databases:
+  - name: crpt-db
+    engine: POSTGRES
+    plan: starter

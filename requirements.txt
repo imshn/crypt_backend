@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+sqlmodel
+requests
+pandas
+python-multipart
+jose
+httpx
+python-dotenv
+jwt
+# if you plan to use PostgreSQL (e.g. in production on Render)
+psycopg2-binary

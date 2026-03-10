@@ -1,0 +1,26 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment
+.env*
+
+# Virtual environment
+.venv/
+
+# SQLite and logs
+*.db
+*.sqlite3
+*.log
+
+# Node stuff (if any frontend code lives here)
+node_modules/
+
+# Git
+.git/
+.gitignore
+
+# VSCode
+.vscode/
