@@ -10,18 +10,18 @@ from typing import Optional
 # Cache JWKS to avoid fetching on every request
 _jwks_cache = {"keys": None, "fetched_at": 0}
 
-def _get_clerk_jwks():
-    """Fetch Clerk's JWKS (cached for 1 hour)."""
-    now = time.time()
-    if _jwks_cache["keys"] and (now - _jwks_cache["fetched_at"]) < 3600:
-        return _jwks_cache["keys"]
-    
-    # Clerk exposes JWKS at this endpoint
-    # The publishable key encodes the frontend API domain
+def _get_clerk_jwks_url() -> str:
+    """Return the JWKS URL for the current Clerk project.
+
+    We don't actually download the keys here; PyJWT's PyJWKClient will
+    handle fetching and caching internally.  This helper only derives the
+    URL from the publishable key, crashing if the key is missing or malformed.
+    """
     pk = os.getenv("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY", "")
     if not pk:
         # crash early with explanatory message (will show in Vercel logs)
         raise HTTPException(status_code=500, detail="Clerk publishable key not set on backend")
+
     # Extract the frontend API URL from the publishable key
     # pk_test_<base64-encoded-frontend-api>
     if pk.startswith("pk_test_") or pk.startswith("pk_live_"):
@@ -32,22 +32,9 @@ def _get_clerk_jwks():
         if padding != 4:
             encoded += "=" * padding
         frontend_api = base64.b64decode(encoded).decode("utf-8").rstrip("$")
-        jwks_url = f"https://{frontend_api}/.well-known/jwks.json"
-    else:
-        raise HTTPException(status_code=500, detail="Invalid Clerk publishable key")
-    
-    try:
-        resp = requests.get(jwks_url, timeout=5)
-        resp.raise_for_status()
-        keys = resp.json().get("keys", [])
-        _jwks_cache["keys"] = keys
-        _jwks_cache["fetched_at"] = now
-        return keys
-    except Exception as e:
-        print(f"Failed to fetch Clerk JWKS: {e}")
-        if _jwks_cache["keys"]:
-            return _jwks_cache["keys"]
-        raise HTTPException(status_code=500, detail="Could not fetch Clerk JWKS")
+        return f"https://{frontend_api}/.well-known/jwks.json"
+
+    raise HTTPException(status_code=500, detail="Invalid Clerk publishable key")
 
 async def get_current_user(authorization: str = Header(None)) -> str:
     """
@@ -62,40 +49,24 @@ async def get_current_user(authorization: str = Header(None)) -> str:
     token = authorization.replace("Bearer ", "")
     
     try:
-        # Get Clerk's public keys
-        jwks = _get_clerk_jwks()
-        
-        # Decode the JWT header to get the key ID (kid)
-        # PyJWT provides a helper to inspect the header without validating
-        unverified_header = jwt.get_unverified_header(token)
-        print("unverified header:", unverified_header)
-        kid = unverified_header.get("kid")
-        
-        # Find the matching key
-        matching_key = None
-        for key in jwks:
-            if key.get("kid") == kid:
-                matching_key = key
-                break
-        print("found matching_key", matching_key)
-        if not matching_key:
-            raise HTTPException(status_code=401, detail="No matching key found for token")
-        
-        # Build the public key from JWKS
-        from jwt.algorithms import RSAAlgorithm
-        public_key = RSAAlgorithm.from_jwk(matching_key)
-        
-        # Verify and decode the token
-        try:
-            payload = jwt.decode(
-                token,
-                public_key,
-                algorithms=["RS256"],
-                options={"verify_aud": False}  # Clerk doesn't set audience by default
-            )
-        except Exception as ex:
-            print("decode exception:", ex)
-            raise
+        # derive the JWKS URL and let PyJWT handle the rest
+        jwks_url = _get_clerk_jwks_url()
+        print("using JWKS URL", jwks_url)
+
+        from jwt import PyJWKClient
+        jwk_client = PyJWKClient(jwks_url)
+
+        # this call fetches (and caches) the appropriate key for the token
+        signing_key = jwk_client.get_signing_key_from_jwt(token)
+        print("signing_key", signing_key)
+
+        # Verify and decode the token in one step
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            options={"verify_aud": False}  # Clerk doesn't set audience by default
+        )
         
         # Return the Clerk user ID
         user_id = payload.get("sub")
