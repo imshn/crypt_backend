@@ -1,4 +1,6 @@
 from fastapi import Header, HTTPException
+# The PyJWT library installs to the "jwt" module namespace.
+# We still import it as jwt to match the package name.
 import jwt
 import requests
 import os
@@ -60,6 +62,7 @@ async def get_current_user(authorization: str = Header(None)) -> str:
         jwks = _get_clerk_jwks()
         
         # Decode the JWT header to get the key ID (kid)
+        # PyJWT provides a helper to inspect the header without validating
         unverified_header = jwt.get_unverified_header(token)
         kid = unverified_header.get("kid")
         

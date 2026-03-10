@@ -7,6 +7,6 @@ python-multipart
 jose
 httpx
 python-dotenv
-jwt
+PyJWT               # JSON Web Token handling (used by auth.py)
 libsql             # Turso / libSQL driver (supports libsql:// URLs)
 libsql-client
