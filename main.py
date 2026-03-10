@@ -17,14 +17,24 @@ from auth import get_current_user
 
 app = FastAPI()
 
+# CORS configuration.  During development a few localhost
+# origins are useful; in production we also need to allow the deployed
+# frontend.  To make this future-proof we read a comma-separated list from
+# the ALLOWED_ORIGINS env var.
+origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://192.168.1.2:3000",
+    "https://multicryptoportfolio.vercel.app",
+]
+extra = os.getenv("ALLOWED_ORIGINS")
+if extra:
+    origins.extend([o.strip() for o in extra.split(",") if o.strip()])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3000",
-        "http://192.168.1.2:3000",
-    ],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
