@@ -19,7 +19,9 @@ def _get_clerk_jwks():
     # Clerk exposes JWKS at this endpoint
     # The publishable key encodes the frontend API domain
     pk = os.getenv("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY", "")
-    
+    if not pk:
+        # crash early with explanatory message (will show in Vercel logs)
+        raise HTTPException(status_code=500, detail="Clerk publishable key not set on backend")
     # Extract the frontend API URL from the publishable key
     # pk_test_<base64-encoded-frontend-api>
     if pk.startswith("pk_test_") or pk.startswith("pk_live_"):
@@ -52,6 +54,8 @@ async def get_current_user(authorization: str = Header(None)) -> str:
     Verify the Clerk JWT from the Authorization header.
     Returns the Clerk user ID (sub claim).
     """
+    # logging token presence helps troubleshoot production issues
+    print("Authorization header received:", authorization)
     if authorization is None or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     
@@ -64,6 +68,7 @@ async def get_current_user(authorization: str = Header(None)) -> str:
         # Decode the JWT header to get the key ID (kid)
         # PyJWT provides a helper to inspect the header without validating
         unverified_header = jwt.get_unverified_header(token)
+        print("unverified header:", unverified_header)
         kid = unverified_header.get("kid")
         
         # Find the matching key
@@ -72,7 +77,7 @@ async def get_current_user(authorization: str = Header(None)) -> str:
             if key.get("kid") == kid:
                 matching_key = key
                 break
-        
+        print("found matching_key", matching_key)
         if not matching_key:
             raise HTTPException(status_code=401, detail="No matching key found for token")
         
@@ -81,12 +86,16 @@ async def get_current_user(authorization: str = Header(None)) -> str:
         public_key = RSAAlgorithm.from_jwk(matching_key)
         
         # Verify and decode the token
-        payload = jwt.decode(
-            token,
-            public_key,
-            algorithms=["RS256"],
-            options={"verify_aud": False}  # Clerk doesn't set audience by default
-        )
+        try:
+            payload = jwt.decode(
+                token,
+                public_key,
+                algorithms=["RS256"],
+                options={"verify_aud": False}  # Clerk doesn't set audience by default
+            )
+        except Exception as ex:
+            print("decode exception:", ex)
+            raise
         
         # Return the Clerk user ID
         user_id = payload.get("sub")
