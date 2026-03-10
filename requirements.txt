@@ -8,5 +8,6 @@ jose
 httpx
 python-dotenv
 PyJWT               # JSON Web Token handling (used by auth.py)
+cryptography        # required by PyJWT for RS256 verification
 libsql             # Turso / libSQL driver (supports libsql:// URLs)
 libsql-client
