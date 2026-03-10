@@ -15,9 +15,15 @@ Built with FastAPI + SQLModel.
         cp .env.example .env.local
         ```
     - Fill in values for Clerk and CoinGecko keys.
-    - For local development you can leave `DATABASE_URL` empty; the
-      application will then create/use a `database.db` SQLite file.  In
-      production you must set `DATABASE_URL` as described below.
+    - Set **only** the Turso variables:
+        ```env
+        TURSO_DATABASE_URL=libsql://...
+        TURSO_AUTH_TOKEN=...
+        ```
+      leaving them blank will default to a local SQLite file (`database.db`)
+      for development.
+    - The `requirements.txt` already includes `libsql` so the Turso client is
+      installed automatically.
 
 ## Running Locally
 
@@ -53,7 +59,9 @@ runtime and makes local testing exactly mirror production.
       -e NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_xxx \
       crpt-backend
     ```
-
+    If you're testing against Turso in the container you could provide
+    `-e TURSO_DATABASE_URL=libsql://... -e TURSO_AUTH_TOKEN=...` instead of
+    `DATABASE_URL`.
 3.  The service will listen on `0.0.0.0:8000` and pick up `$PORT` if set.
 
 ### Render configuration
@@ -65,8 +73,8 @@ runtime and makes local testing exactly mirror production.
     image using the `Dockerfile` in the repo.
 
 3.  **Environment Variables**
-    - `DATABASE_URL` (Render sets this automatically after you attach a
-      managed Postgres database).
+    - `TURSO_DATABASE_URL` (provided by Vercel/Turso upon deployment).
+      Include `TURSO_AUTH_TOKEN` for protected databases.
     - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` and other Clerk keys.
     - `COINGECKO_API_KEY` if desired.
 

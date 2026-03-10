@@ -7,20 +7,36 @@ from sqlmodel import SQLModel, create_engine, Session
 # accordingly. For local development we fall back to a file-backed SQLite
 # database so you don't need to install anything else.
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Only Turso/SQLite is supported now.  In production the only
+# relevant variable is `TURSO_DATABASE_URL` (plus `TURSO_AUTH_TOKEN` when
+# the database is private).  For local development we still fall back to a
+# file-backed SQLite database so you don't need to install anything else.
 
-if DATABASE_URL:
-    # SQLAlchemy 2.0 prefers the `postgresql://` scheme; some providers
-    # (Heroku, Render) still hand out URLs with `postgres://`.  Rewrite
-    # it here to avoid the warning.
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+TURSO_URL = os.getenv("TURSO_DATABASE_URL")
 
-    # Expect a full SQLAlchemy URL, e.g.:
-    #   postgresql://user:password@hostname:5432/dbname
-    # Render will automatically set this when you add a Postgres database
-    # via the dashboard. Don't enable echo in production.
-    engine = create_engine(DATABASE_URL, echo=False)
+if TURSO_URL:
+    import libsql
+
+    # SQLAlchemy expects a DB‑API connection that behaves like the standard
+    # sqlite3 module.  The libsql client lacks a couple of methods so we
+    # wrap it and stub out whatever SQLAlchemy uses.
+    class _SQLiteShim:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def create_function(self, name, num_params, fn, **kwargs):
+            # Turso doesn't support user-defined functions; noop is fine.
+            return None
+
+        def __getattr__(self, attr):
+            return getattr(self._inner, attr)
+
+    def _turso_creator():
+        auth = os.getenv("TURSO_AUTH_TOKEN", "")
+        raw_conn = libsql.connect(TURSO_URL, auth_token=auth)
+        return _SQLiteShim(raw_conn)
+
+    engine = create_engine("sqlite://", echo=False, creator=_turso_creator)
 else:
     # Development / local fallback
     sqlite_file_name = "database.db"

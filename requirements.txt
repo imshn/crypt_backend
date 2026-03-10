@@ -8,5 +8,5 @@ jose
 httpx
 python-dotenv
 jwt
-# if you plan to use PostgreSQL (e.g. in production on Render)
-psycopg2-binary
+libsql             # Turso / libSQL driver (supports libsql:// URLs)
+libsql-client
