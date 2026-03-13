@@ -10,15 +10,30 @@ class LotManager:
     def __init__(self, session: Session):
         self.session = session
 
+    def _normalize_fee_type(self, fee_type) -> str:
+        raw = fee_type.value if hasattr(fee_type, "value") else str(fee_type or "")
+        return raw.strip().upper()
+
     def process_buy(self, trade: Trade):
         """Creates a new TaxLot for a Buy trade."""
         # GROSS logic: Cost basis is just the trade price. Fees are tracked separately.
         cost_basis_per_unit = Decimal(str(trade.price))
+
+        qty = Decimal(str(trade.quantity))
+        net_qty = qty
+
+        if self._normalize_fee_type(trade.fee_type) == "PERCENTAGE":
+            fee_percent = Decimal(str(trade.fee or 0.0))
+            fee_units = qty * (fee_percent / Decimal("100"))
+            net_qty = qty - fee_units
+
+        if net_qty <= Decimal("0"):
+            raise ValueError("Fee is too high. Net BUY units must be greater than 0.")
         
         lot = TaxLot(
             trade_id=trade.id,
-            original_qty=trade.quantity,
-            remaining_qty=trade.quantity,
+            original_qty=float(net_qty),
+            remaining_qty=float(net_qty),
             cost_basis=float(cost_basis_per_unit),
             timestamp=trade.timestamp
         )

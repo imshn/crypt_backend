@@ -51,7 +51,7 @@ class Calculator:
             cost = Decimal(str(lot.cost_basis))
             
             # Pro-rated fee calculation
-            orig_qty = Decimal(str(lot.trade.quantity))
+            orig_qty = Decimal(str(lot.original_qty))
             orig_fee_value = self._trade_fee_value(lot.trade)
             lot_pro_rated_fee = (qty / orig_qty) * orig_fee_value if orig_qty > 0 else Decimal("0")
             
@@ -137,7 +137,7 @@ class Calculator:
             qty = Decimal(str(lot.remaining_qty))
             cost = Decimal(str(lot.cost_basis))
             
-            orig_qty = Decimal(str(lot.trade.quantity))
+            orig_qty = Decimal(str(lot.original_qty))
             orig_fee_value = self._trade_fee_value(lot.trade)
             lot_pro_rated_fee = (qty / orig_qty) * orig_fee_value if orig_qty > 0 else Decimal("0")
             

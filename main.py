@@ -106,6 +106,18 @@ def get_fee_value(price: float, quantity: float, fee: float, fee_type: str) -> f
         return get_fee_units(quantity, fee, fee_type) * price
     return fee
 
+
+def get_buy_cash_required(total_val: float, fee_value: float, fee_type: str) -> float:
+    if normalize_fee_type(fee_type) == "PERCENTAGE":
+        return total_val
+    return total_val + fee_value
+
+
+def get_buy_net_quantity(quantity: float, fee: float, fee_type: str) -> float:
+    if normalize_fee_type(fee_type) == "PERCENTAGE":
+        return quantity - get_fee_units(quantity, fee, fee_type)
+    return quantity
+
 # --- Portfolios ---
 @app.post("/api/portfolios", response_model=Portfolio)
 def create_portfolio(name: str, user_id: str = Depends(get_current_user), session: Session = Depends(get_session)):
@@ -250,7 +262,7 @@ def add_trade(portfolio_id: int, coin_id: str, symbol: str, type: str, price: fl
 
     total_val = price * quantity
     if trade_type == "BUY":
-        cash_required = total_val + fee_value
+        cash_required = get_buy_cash_required(total_val, fee_value, normalized_fee_type)
         cash_balance = get_cash_balance(session, portfolio_id)
         if cash_required - cash_balance > 1e-8:
             raise HTTPException(
@@ -289,13 +301,15 @@ def add_trade(portfolio_id: int, coin_id: str, symbol: str, type: str, price: fl
         raise HTTPException(status_code=400, detail=str(e))
             
     # 3. Update Cash Balance
-    # Cash Impact = -(Total Value + FeeValue) if BUY.
-    # Cash Impact = (Total Value - FeeValue) if SELL.
+    # For BUY:
+    # - FIXED fee: cash = total value + fee value
+    # - PERCENTAGE fee on units: cash = total value (fee is deducted from units)
+    # For SELL: cash = total value - fee value
     
     cash_change = 0.0
     
     if trade_type == "BUY":
-        cash_change = -(total_val + fee_value)
+        cash_change = -get_buy_cash_required(total_val, fee_value, normalized_fee_type)
     else:
         cash_change = (total_val - fee_value)
         
@@ -356,8 +370,11 @@ def update_buy_trade(
 
     current_cash = get_cash_balance(session, portfolio_id)
 
-    old_cash_change = -((trade.price * trade.quantity) + old_fee_value)
-    new_cash_change = -((price * quantity) + new_fee_value)
+    old_total_val = trade.price * trade.quantity
+    new_total_val = price * quantity
+
+    old_cash_change = -get_buy_cash_required(old_total_val, old_fee_value, old_fee_type)
+    new_cash_change = -get_buy_cash_required(new_total_val, new_fee_value, normalized_fee_type)
     cash_delta = new_cash_change - old_cash_change
 
     if cash_delta < 0 and (current_cash + cash_delta) < -1e-8:
@@ -371,8 +388,12 @@ def update_buy_trade(
     trade.fee = fee
     trade.fee_type = normalized_fee_type
 
-    lot.original_qty = quantity
-    lot.remaining_qty = quantity
+    net_quantity = get_buy_net_quantity(quantity, fee, normalized_fee_type)
+    if net_quantity <= 0:
+        raise HTTPException(status_code=400, detail="Fee is too high. Net BUY units must be greater than 0.")
+
+    lot.original_qty = net_quantity
+    lot.remaining_qty = net_quantity
     lot.cost_basis = price
 
     session.add(trade)
