@@ -3,10 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pathlib import Path
 import os
+import time
+import requests
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env.local")
 from sqlmodel import Session, select
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 from database import create_db_and_tables, get_session
 from models import User, Portfolio, Trade, TaxLot, WalletTransaction, TradeType
@@ -16,6 +18,19 @@ from coingecko_client import CoinGeckoClient
 from auth import get_current_user
 
 app = FastAPI()
+
+SUPPORTED_CURRENCIES = ["USD", "INR", "KWD", "EUR"]
+FALLBACK_FX_RATES = {
+    "USD": 1.0,
+    "INR": 83.0,
+    "KWD": 0.307,
+    "EUR": 0.92,
+}
+FX_CACHE_TTL_SECONDS = 60
+_fx_cache: Dict[str, Any] = {
+    "timestamp": 0.0,
+    "payload": None,
+}
 
 # CORS configuration.  During development a few localhost
 # origins are useful; in production we also need to allow the deployed
@@ -47,6 +62,49 @@ def on_startup():
 @app.get("/api/health")
 def health_check():
     return {"status": "ok"}
+
+
+def get_cash_balance(session: Session, portfolio_id: int) -> float:
+    txns = session.exec(
+        select(WalletTransaction).where(WalletTransaction.portfolio_id == portfolio_id)
+    ).all()
+
+    cash_balance = 0.0
+    for txn in txns:
+        txn_type = (txn.type or "").strip().upper()
+        txn_amount = abs(txn.amount or 0.0)
+        if txn_type == "DEPOSIT":
+            cash_balance += txn_amount
+        elif txn_type == "WITHDRAW":
+            cash_balance -= txn_amount
+
+    return cash_balance
+
+
+def get_portfolio_or_404(session: Session, portfolio_id: int) -> Portfolio:
+    portfolio = session.exec(
+        select(Portfolio).where(Portfolio.id == portfolio_id)
+    ).first()
+    if not portfolio:
+        raise HTTPException(status_code=404, detail=f"Portfolio {portfolio_id} not found")
+    return portfolio
+
+
+def normalize_fee_type(value: Any) -> str:
+    raw = value.value if hasattr(value, "value") else str(value or "")
+    return raw.strip().upper()
+
+
+def get_fee_units(quantity: float, fee: float, fee_type: str) -> float:
+    if normalize_fee_type(fee_type) != "PERCENTAGE":
+        return 0.0
+    return quantity * (fee / 100.0)
+
+
+def get_fee_value(price: float, quantity: float, fee: float, fee_type: str) -> float:
+    if normalize_fee_type(fee_type) == "PERCENTAGE":
+        return get_fee_units(quantity, fee, fee_type) * price
+    return fee
 
 # --- Portfolios ---
 @app.post("/api/portfolios", response_model=Portfolio)
@@ -87,21 +145,118 @@ def get_coin_ohlc(coin_id: str, days: int = 7):
     client = CoinGeckoClient()
     return client.get_ohlc(coin_id, days)
 
+
+@app.get("/api/fx/rates")
+def get_fx_rates():
+    """Return USD-based FX rates for supported display currencies."""
+    now = time.time()
+    cached_payload = _fx_cache.get("payload")
+    cached_ts = float(_fx_cache.get("timestamp") or 0.0)
+
+    if cached_payload and (now - cached_ts) < FX_CACHE_TTL_SECONDS:
+        return cached_payload
+
+    symbols = ",".join(c for c in SUPPORTED_CURRENCIES if c != "USD")
+    try:
+        resp = requests.get(
+            "https://api.frankfurter.app/latest",
+            params={"from": "USD", "to": symbols},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        rates = body.get("rates", {})
+
+        payload = {
+            "base": "USD",
+            "rates": {
+                "USD": 1.0,
+                "INR": float(rates.get("INR", 0)),
+                "KWD": float(rates.get("KWD", 0)),
+                "EUR": float(rates.get("EUR", 0)),
+            },
+            "source": "frankfurter",
+            "timestamp": int(now),
+        }
+
+        for currency in SUPPORTED_CURRENCIES:
+            if payload["rates"].get(currency, 0) <= 0:
+                raise ValueError(f"Missing FX rate for {currency}")
+
+        _fx_cache["timestamp"] = now
+        _fx_cache["payload"] = payload
+        return payload
+    except Exception as exc:
+        print(f"FX rate fetch failed: {exc}")
+        if cached_payload:
+            return cached_payload
+
+        return {
+            "base": "USD",
+            "rates": FALLBACK_FX_RATES,
+            "source": "fallback",
+            "timestamp": int(now),
+        }
+
 # --- Wallet ---
 @app.post("/api/wallet/transaction")
 def wallet_transaction(portfolio_id: int, type: str, amount: float, session: Session = Depends(get_session)):
-    txn = WalletTransaction(portfolio_id=portfolio_id, type=type, amount=amount)
+    get_portfolio_or_404(session, portfolio_id)
+
+    txn_type = (type or "").strip().upper()
+    if txn_type not in {"DEPOSIT", "WITHDRAW"}:
+        raise HTTPException(status_code=400, detail="Invalid transaction type")
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than 0")
+
+    if txn_type == "WITHDRAW":
+        cash_balance = get_cash_balance(session, portfolio_id)
+        if amount - cash_balance > 1e-8:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient cash. Available: ${cash_balance:.2f}, Requested: ${amount:.2f}"
+            )
+
+    txn = WalletTransaction(portfolio_id=portfolio_id, type=txn_type, amount=amount)
     session.add(txn)
     session.commit()
-    return {"status": "success", "txn_id": txn.id}
+
+    return {
+        "status": "success",
+        "txn_id": txn.id,
+        "cash_balance": get_cash_balance(session, portfolio_id),
+    }
 
 # --- Trades ---
 @app.post("/api/trades")
 def add_trade(portfolio_id: int, coin_id: str, symbol: str, type: str, price: float, quantity: float, fee: float = 0.0, fee_type: str = "FIXED", target_lot_id: Optional[int] = Query(None), session: Session = Depends(get_session)):
-    # Calculate absolute fee if percentage
-    actual_fee = fee
-    if fee_type.upper() == "PERCENTAGE":
-        actual_fee = (price * quantity) * (fee / 100.0)
+    get_portfolio_or_404(session, portfolio_id)
+
+    trade_type = (type or "").strip().upper()
+    normalized_fee_type = (fee_type or "").strip().upper()
+
+    if trade_type not in {"BUY", "SELL"}:
+        raise HTTPException(status_code=400, detail="Invalid trade type")
+    if normalized_fee_type not in {"FIXED", "PERCENTAGE"}:
+        raise HTTPException(status_code=400, detail="Invalid fee type")
+    if price <= 0 or quantity <= 0 or fee < 0:
+        raise HTTPException(status_code=400, detail="Price and quantity must be positive and fee cannot be negative")
+
+    # For percentage fees we store fee as percentage input and derive fee value from units.
+    # fee_units = quantity * (percentage / 100)
+    # fee_value = fee_units * price
+    stored_fee = fee
+    fee_value = get_fee_value(price, quantity, fee, normalized_fee_type)
+
+    total_val = price * quantity
+    if trade_type == "BUY":
+        cash_required = total_val + fee_value
+        cash_balance = get_cash_balance(session, portfolio_id)
+        if cash_required - cash_balance > 1e-8:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient cash. Available: ${cash_balance:.2f}, Required: ${cash_required:.2f}"
+            )
 
     # 1. Record Trade
     trade = Trade(
@@ -109,11 +264,11 @@ def add_trade(portfolio_id: int, coin_id: str, symbol: str, type: str, price: fl
         target_lot_id=target_lot_id,
         coin_id=coin_id,
         symbol=symbol,
-        type=type, # BUY/SELL
+        type=trade_type, # BUY/SELL
         price=price,
         quantity=quantity,
-        fee=actual_fee,
-        fee_type=fee_type.upper()
+        fee=stored_fee,
+        fee_type=normalized_fee_type
     )
     session.add(trade)
     session.commit()
@@ -124,9 +279,9 @@ def add_trade(portfolio_id: int, coin_id: str, symbol: str, type: str, price: fl
     realized_pnl = 0.0
     
     try:
-        if type.upper() == "BUY":
+        if trade_type == "BUY":
             lot_manager.process_buy(trade)
-        elif type.upper() == "SELL":
+        elif trade_type == "SELL":
             realized_pnl = lot_manager.process_sell(trade)
     except ValueError as e:
         session.delete(trade) # Rollback trade if lot logic fails
@@ -134,18 +289,15 @@ def add_trade(portfolio_id: int, coin_id: str, symbol: str, type: str, price: fl
         raise HTTPException(status_code=400, detail=str(e))
             
     # 3. Update Cash Balance
-    # Fee is always deducted from cash? 
-    # Or is fee part of cost basis? 
-    # For simplicity: Cash Impact = -(Total Value + Fee) if BUY.
-    # Cash Impact = (Total Value - Fee) if SELL.
+    # Cash Impact = -(Total Value + FeeValue) if BUY.
+    # Cash Impact = (Total Value - FeeValue) if SELL.
     
-    total_val = price * quantity
     cash_change = 0.0
     
-    if type.upper() == "BUY":
-        cash_change = -(total_val + actual_fee)
+    if trade_type == "BUY":
+        cash_change = -(total_val + fee_value)
     else:
-        cash_change = (total_val - actual_fee)
+        cash_change = (total_val - fee_value)
         
     txn_type = "DEPOSIT" if cash_change > 0 else "WITHDRAW"
     
@@ -160,20 +312,111 @@ def add_trade(portfolio_id: int, coin_id: str, symbol: str, type: str, price: fl
 
     return {"trade_id": trade.id, "realized_pnl": realized_pnl}
 
+
+@app.patch("/api/trades/{trade_id}")
+def update_buy_trade(
+    trade_id: int,
+    portfolio_id: int,
+    price: float,
+    quantity: float,
+    fee: float = 0.0,
+    fee_type: str = "FIXED",
+    session: Session = Depends(get_session)
+):
+    if price <= 0 or quantity <= 0 or fee < 0:
+        raise HTTPException(status_code=400, detail="Price and quantity must be positive and fee cannot be negative")
+    normalized_fee_type = (fee_type or "").strip().upper()
+    if normalized_fee_type not in {"FIXED", "PERCENTAGE"}:
+        raise HTTPException(status_code=400, detail="Invalid fee type")
+
+    trade = session.exec(
+        select(Trade)
+        .where(Trade.id == trade_id)
+        .where(Trade.portfolio_id == portfolio_id)
+    ).first()
+
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    if trade.type != TradeType.BUY:
+        raise HTTPException(status_code=400, detail="Only BUY trades can be edited")
+
+    lot = session.exec(select(TaxLot).where(TaxLot.trade_id == trade.id)).first()
+    if not lot:
+        raise HTTPException(status_code=404, detail="Tax lot not found for this trade")
+
+    # Prevent editing lots that were partially closed because realized P/L history
+    # for already-closed chunks would become inconsistent.
+    if abs(lot.remaining_qty - lot.original_qty) > 1e-8:
+        raise HTTPException(status_code=400, detail="This lot is partially sold and cannot be edited")
+
+    new_fee_value = get_fee_value(price, quantity, fee, normalized_fee_type)
+    old_fee_type = normalize_fee_type(trade.fee_type)
+    old_fee_value = get_fee_value(trade.price, trade.quantity, trade.fee or 0.0, old_fee_type)
+
+    current_cash = get_cash_balance(session, portfolio_id)
+
+    old_cash_change = -((trade.price * trade.quantity) + old_fee_value)
+    new_cash_change = -((price * quantity) + new_fee_value)
+    cash_delta = new_cash_change - old_cash_change
+
+    if cash_delta < 0 and (current_cash + cash_delta) < -1e-8:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient cash for edit. Available: ${current_cash:.2f}, Additional required: ${abs(cash_delta):.2f}"
+        )
+
+    trade.price = price
+    trade.quantity = quantity
+    trade.fee = fee
+    trade.fee_type = normalized_fee_type
+
+    lot.original_qty = quantity
+    lot.remaining_qty = quantity
+    lot.cost_basis = price
+
+    session.add(trade)
+    session.add(lot)
+
+    # Keep wallet balance consistent after historical trade edits.
+    if abs(cash_delta) > 1e-8:
+        wallet_txn = WalletTransaction(
+            portfolio_id=portfolio_id,
+            type="DEPOSIT" if cash_delta > 0 else "WITHDRAW",
+            amount=abs(cash_delta),
+            timestamp=datetime.utcnow(),
+        )
+        session.add(wallet_txn)
+
+    session.commit()
+
+    return {
+        "status": "success",
+        "trade_id": trade.id,
+        "lot_id": lot.id,
+        "price": trade.price,
+        "quantity": trade.quantity,
+        "fee": trade.fee,
+        "fee_value": get_fee_value(trade.price, trade.quantity, trade.fee or 0.0, normalize_fee_type(trade.fee_type)),
+    }
+
 @app.get("/api/trades", response_model=List[Trade])
 def get_trades(portfolio_id: int, session: Session = Depends(get_session)):
+    get_portfolio_or_404(session, portfolio_id)
     trades = session.exec(select(Trade).where(Trade.portfolio_id == portfolio_id).order_by(Trade.timestamp.desc())).all()
     return trades
 
 @app.get("/api/portfolio/{portfolio_id}/positions/{coin_id}")
 def get_position_detail(portfolio_id: int, coin_id: str, session: Session = Depends(get_session)):
     """Fetch metrics for a specific coin in a portfolio, even if balance is zero."""
+    get_portfolio_or_404(session, portfolio_id)
     calc = Calculator(session)
     return calc.get_position_detail(portfolio_id, coin_id)
 
 @app.get("/api/portfolio/{portfolio_id}/positions/{coin_id}/lots")
 def get_position_lots(portfolio_id: int, coin_id: str, session: Session = Depends(get_session)):
     """Fetch all open tax lots for a specific coin in a portfolio."""
+    get_portfolio_or_404(session, portfolio_id)
     statement = (
         select(TaxLot)
         .join(Trade)
@@ -195,6 +438,9 @@ def get_position_lots(portfolio_id: int, coin_id: str, session: Session = Depend
             "remaining_qty": lot.remaining_qty,
             "cost_basis": lot.cost_basis,
             "fee": lot.trade.fee,
+            "fee_type": normalize_fee_type(lot.trade.fee_type),
+            "fee_units": get_fee_units(lot.trade.quantity, lot.trade.fee or 0.0, normalize_fee_type(lot.trade.fee_type)),
+            "fee_value": get_fee_value(lot.trade.price, lot.trade.quantity, lot.trade.fee or 0.0, normalize_fee_type(lot.trade.fee_type)),
             "timestamp": lot.timestamp
         }
         for lot in lots
@@ -203,16 +449,16 @@ def get_position_lots(portfolio_id: int, coin_id: str, session: Session = Depend
 # --- Dashboard & Positions (Calculated View) ---
 @app.get("/api/portfolio/{portfolio_id}/positions")
 def get_positions(portfolio_id: int, session: Session = Depends(get_session)):
+    get_portfolio_or_404(session, portfolio_id)
     calc = Calculator(session)
     return calc.get_positions(portfolio_id)
 
 @app.get("/api/portfolio/{portfolio_id}/summary")
 def get_summary(portfolio_id: int, session: Session = Depends(get_session)):
+    get_portfolio_or_404(session, portfolio_id)
     calc = Calculator(session)
-    
-    # Get Cash Balance
-    txns = session.exec(select(WalletTransaction).where(WalletTransaction.portfolio_id == portfolio_id)).all()
-    cash_balance = sum([t.amount if t.type == "DEPOSIT" else -t.amount for t in txns])
+
+    cash_balance = get_cash_balance(session, portfolio_id)
     
     metrics = calc.get_summary(portfolio_id)
     
