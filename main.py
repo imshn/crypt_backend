@@ -118,6 +118,12 @@ def get_buy_net_quantity(quantity: float, fee: float, fee_type: str) -> float:
         return quantity - get_fee_units(quantity, fee, fee_type)
     return quantity
 
+
+def get_buy_cost_basis_per_unit(price: float, quantity: float, net_quantity: float, fee_type: str) -> float:
+    if normalize_fee_type(fee_type) == "PERCENTAGE" and net_quantity > 0:
+        return (price * quantity) / net_quantity
+    return price
+
 # --- Portfolios ---
 @app.post("/api/portfolios", response_model=Portfolio)
 def create_portfolio(name: str, user_id: str = Depends(get_current_user), session: Session = Depends(get_session)):
@@ -394,7 +400,11 @@ def update_buy_trade(
 
     lot.original_qty = net_quantity
     lot.remaining_qty = net_quantity
-    lot.cost_basis = price
+    if normalized_fee_type == "PERCENTAGE":
+        # Gross cash is based on original quantity; distribute across net units.
+        lot.cost_basis = (price * quantity) / net_quantity
+    else:
+        lot.cost_basis = price
 
     session.add(trade)
     session.add(lot)
@@ -449,23 +459,25 @@ def get_position_lots(portfolio_id: int, coin_id: str, session: Session = Depend
     lots = session.exec(statement).all()
     
     # Return lots with some trade context
-    return [
-        {
+    response = []
+    for lot in lots:
+        fee_type = normalize_fee_type(lot.trade.fee_type)
+        net_qty = lot.original_qty
+        response.append({
             "id": lot.id,
             "trade_id": lot.trade_id,
             "symbol": lot.trade.symbol,
             "purchase_price": lot.trade.price,
             "original_qty": lot.original_qty,
             "remaining_qty": lot.remaining_qty,
-            "cost_basis": lot.cost_basis,
+            "cost_basis": get_buy_cost_basis_per_unit(lot.trade.price, lot.trade.quantity, net_qty, fee_type),
             "fee": lot.trade.fee,
-            "fee_type": normalize_fee_type(lot.trade.fee_type),
-            "fee_units": get_fee_units(lot.trade.quantity, lot.trade.fee or 0.0, normalize_fee_type(lot.trade.fee_type)),
-            "fee_value": get_fee_value(lot.trade.price, lot.trade.quantity, lot.trade.fee or 0.0, normalize_fee_type(lot.trade.fee_type)),
+            "fee_type": fee_type,
+            "fee_units": get_fee_units(lot.trade.quantity, lot.trade.fee or 0.0, fee_type),
+            "fee_value": get_fee_value(lot.trade.price, lot.trade.quantity, lot.trade.fee or 0.0, fee_type),
             "timestamp": lot.timestamp
-        }
-        for lot in lots
-    ]
+        })
+    return response
 
 # --- Dashboard & Positions (Calculated View) ---
 @app.get("/api/portfolio/{portfolio_id}/positions")

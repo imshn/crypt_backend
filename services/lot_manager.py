@@ -16,9 +16,7 @@ class LotManager:
 
     def process_buy(self, trade: Trade):
         """Creates a new TaxLot for a Buy trade."""
-        # GROSS logic: Cost basis is just the trade price. Fees are tracked separately.
-        cost_basis_per_unit = Decimal(str(trade.price))
-
+        # Cost basis per unit should reflect actual cash spent per net unit.
         qty = Decimal(str(trade.quantity))
         net_qty = qty
 
@@ -26,6 +24,11 @@ class LotManager:
             fee_percent = Decimal(str(trade.fee or 0.0))
             fee_units = qty * (fee_percent / Decimal("100"))
             net_qty = qty - fee_units
+            # Cash spent is based on gross qty, but net units received are reduced by fee units.
+            cost_basis_per_unit = (Decimal(str(trade.price)) * qty) / net_qty
+        else:
+            # FIXED fee is tracked separately; keep unit price as cost basis.
+            cost_basis_per_unit = Decimal(str(trade.price))
 
         if net_qty <= Decimal("0"):
             raise ValueError("Fee is too high. Net BUY units must be greater than 0.")

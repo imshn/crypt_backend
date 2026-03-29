@@ -9,6 +9,16 @@ class Calculator:
         self.session = session
         self.cg_client = CoinGeckoClient()
 
+    def _lot_cost_basis(self, lot: TaxLot) -> Decimal:
+        price = Decimal(str(lot.trade.price or 0.0))
+        fee_type = (lot.trade.fee_type.value if hasattr(lot.trade.fee_type, "value") else str(lot.trade.fee_type or "")).strip().upper()
+        if fee_type == "PERCENTAGE":
+            net_qty = Decimal(str(lot.original_qty or 0.0))
+            gross_qty = Decimal(str(lot.trade.quantity or 0.0))
+            if net_qty > 0:
+                return (price * gross_qty) / net_qty
+        return price
+
     def _trade_fee_value(self, trade: Trade) -> Decimal:
         fee = Decimal(str(trade.fee or 0.0))
         fee_type = (trade.fee_type.value if hasattr(trade.fee_type, "value") else str(trade.fee_type or "")).strip().upper()
@@ -42,13 +52,14 @@ class Calculator:
                     "symbol": symbol,
                     "units": Decimal("0"),
                     "invested": Decimal("0"),
+                    "avg_open_total": Decimal("0"),
                     "fees": Decimal("0"),
                     "current_value": Decimal("0"),
                     "open_lots": 0,
                 }
             
             qty = Decimal(str(lot.remaining_qty))
-            cost = Decimal(str(lot.cost_basis))
+            cost = self._lot_cost_basis(lot)
             
             # Pro-rated fee calculation
             orig_qty = Decimal(str(lot.original_qty))
@@ -57,6 +68,7 @@ class Calculator:
             
             assets[coin_id]["units"] += qty
             assets[coin_id]["invested"] += (qty * cost)
+            assets[coin_id]["avg_open_total"] += (qty * Decimal(str(lot.trade.price or 0.0)))
             assets[coin_id]["fees"] += lot_pro_rated_fee
             assets[coin_id]["open_lots"] += 1
 
@@ -75,9 +87,10 @@ class Calculator:
             
             units = data["units"]
             invested = data["invested"]
+            avg_open_total = data["avg_open_total"]
             current_val = units * current_price
             
-            avg_price = invested / units if units > 0 else 0
+            avg_price = avg_open_total / units if units > 0 else 0
             unrealized_pnl = current_val - invested
             pnl_percent = (unrealized_pnl / invested * 100) if invested > 0 else 0
             
@@ -131,11 +144,12 @@ class Calculator:
         # 3. Aggregate metrics
         units = Decimal("0")
         invested = Decimal("0")
+        avg_open_total = Decimal("0")
         fees = Decimal("0")
         
         for lot in lots:
             qty = Decimal(str(lot.remaining_qty))
-            cost = Decimal(str(lot.cost_basis))
+            cost = self._lot_cost_basis(lot)
             
             orig_qty = Decimal(str(lot.original_qty))
             orig_fee_value = self._trade_fee_value(lot.trade)
@@ -143,6 +157,7 @@ class Calculator:
             
             units += qty
             invested += (qty * cost)
+            avg_open_total += (qty * Decimal(str(lot.trade.price or 0.0)))
             fees += lot_pro_rated_fee
 
         # 4. Live Price
@@ -151,7 +166,7 @@ class Calculator:
         daily_change_pct = Decimal(str(prices.get(coin_id, {}).get("usd_24h_change", 0)))
         
         current_val = units * current_price
-        avg_price = invested / units if units > 0 else 0
+        avg_price = avg_open_total / units if units > 0 else 0
         unrealized_pnl = current_val - invested
         pnl_percent = (unrealized_pnl / invested * 100) if invested > 0 else 0
         daily_pnl = current_val * (daily_change_pct / 100)
