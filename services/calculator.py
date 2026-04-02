@@ -9,12 +9,12 @@ class Calculator:
         self.session = session
         self.cg_client = CoinGeckoClient()
 
-    def _lot_cost_basis(self, lot: TaxLot) -> Decimal:
-        price = Decimal(str(lot.trade.price or 0.0))
-        fee_type = (lot.trade.fee_type.value if hasattr(lot.trade.fee_type, "value") else str(lot.trade.fee_type or "")).strip().upper()
+    def _lot_cost_basis(self, lot: TaxLot, trade: Trade) -> Decimal:
+        price = Decimal(str(trade.price or 0.0))
+        fee_type = (trade.fee_type.value if hasattr(trade.fee_type, "value") else str(trade.fee_type or "")).strip().upper()
         if fee_type == "PERCENTAGE":
             net_qty = Decimal(str(lot.original_qty or 0.0))
-            gross_qty = Decimal(str(lot.trade.quantity or 0.0))
+            gross_qty = Decimal(str(trade.quantity or 0.0))
             if net_qty > 0:
                 return (price * gross_qty) / net_qty
         return price
@@ -34,7 +34,7 @@ class Calculator:
     def get_positions(self, portfolio_id: int) -> List[Dict[str, Any]]:
         # 1. Fetch Open Lots
         statement = (
-            select(TaxLot)
+            select(TaxLot, Trade)
             .join(Trade)
             .where(Trade.portfolio_id == portfolio_id)
             .where(TaxLot.remaining_qty > 0)
@@ -43,9 +43,9 @@ class Calculator:
         
         # 2. Group by Asset
         assets = {}
-        for lot in lots:
-            coin_id = lot.trade.coin_id
-            symbol = lot.trade.symbol
+        for lot, trade in lots:
+            coin_id = trade.coin_id
+            symbol = trade.symbol
             
             if coin_id not in assets:
                 assets[coin_id] = {
@@ -59,16 +59,16 @@ class Calculator:
                 }
             
             qty = Decimal(str(lot.remaining_qty))
-            cost = self._lot_cost_basis(lot)
+            cost = self._lot_cost_basis(lot, trade)
             
             # Pro-rated fee calculation
             orig_qty = Decimal(str(lot.original_qty))
-            orig_fee_value = self._trade_fee_value(lot.trade)
+            orig_fee_value = self._trade_fee_value(trade)
             lot_pro_rated_fee = (qty / orig_qty) * orig_fee_value if orig_qty > 0 else Decimal("0")
             
             assets[coin_id]["units"] += qty
             assets[coin_id]["invested"] += (qty * cost)
-            assets[coin_id]["avg_open_total"] += (qty * Decimal(str(lot.trade.price or 0.0)))
+            assets[coin_id]["avg_open_total"] += (qty * Decimal(str(trade.price or 0.0)))
             assets[coin_id]["fees"] += lot_pro_rated_fee
             assets[coin_id]["open_lots"] += 1
 
@@ -118,7 +118,7 @@ class Calculator:
         """Calculates metrics for a single coin, supporting zero-balance views."""
         # 1. Fetch Open Lots
         statement = (
-            select(TaxLot)
+            select(TaxLot, Trade)
             .join(Trade)
             .where(Trade.portfolio_id == portfolio_id)
             .where(Trade.coin_id == coin_id)
@@ -129,7 +129,7 @@ class Calculator:
         # 2. Derive Symbol (from any trade for this coin if no open lots)
         symbol = "—"
         if lots:
-            symbol = lots[0].trade.symbol
+            symbol = lots[0][1].symbol
         else:
             # Check any trade
             last_trade = self.session.exec(
@@ -147,17 +147,17 @@ class Calculator:
         avg_open_total = Decimal("0")
         fees = Decimal("0")
         
-        for lot in lots:
+        for lot, trade in lots:
             qty = Decimal(str(lot.remaining_qty))
-            cost = self._lot_cost_basis(lot)
+            cost = self._lot_cost_basis(lot, trade)
             
             orig_qty = Decimal(str(lot.original_qty))
-            orig_fee_value = self._trade_fee_value(lot.trade)
+            orig_fee_value = self._trade_fee_value(trade)
             lot_pro_rated_fee = (qty / orig_qty) * orig_fee_value if orig_qty > 0 else Decimal("0")
             
             units += qty
             invested += (qty * cost)
-            avg_open_total += (qty * Decimal(str(lot.trade.price or 0.0)))
+            avg_open_total += (qty * Decimal(str(trade.price or 0.0)))
             fees += lot_pro_rated_fee
 
         # 4. Live Price

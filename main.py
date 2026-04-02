@@ -11,7 +11,7 @@ from sqlmodel import Session, select
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from database import create_db_and_tables, get_session
-from models import User, Portfolio, Trade, TaxLot, WalletTransaction, TradeType
+from models import User, Portfolio, Trade, TaxLot, WalletTransaction, TradeType, LotClosure
 from services.lot_manager import LotManager
 from services.calculator import Calculator
 from coingecko_client import CoinGeckoClient
@@ -431,11 +431,157 @@ def update_buy_trade(
         "fee_value": get_fee_value(trade.price, trade.quantity, trade.fee or 0.0, normalize_fee_type(trade.fee_type)),
     }
 
+@app.delete("/api/trades/{trade_id}")
+def delete_buy_trade(
+    trade_id: int,
+    portfolio_id: int,
+    session: Session = Depends(get_session)
+):
+    trade = session.exec(
+        select(Trade)
+        .where(Trade.id == trade_id)
+        .where(Trade.portfolio_id == portfolio_id)
+    ).first()
+
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    if trade.type != TradeType.BUY:
+        raise HTTPException(status_code=400, detail="Only BUY trades can be deleted")
+
+    lot = session.exec(select(TaxLot).where(TaxLot.trade_id == trade.id)).first()
+    if not lot:
+        raise HTTPException(status_code=404, detail="Tax lot not found for this trade")
+
+    if abs(lot.remaining_qty - lot.original_qty) > 1e-8:
+        raise HTTPException(status_code=400, detail="This lot is partially sold and cannot be deleted")
+
+    fee_type = normalize_fee_type(trade.fee_type)
+    fee_value = get_fee_value(trade.price, trade.quantity, trade.fee or 0.0, fee_type)
+    total_val = trade.price * trade.quantity
+    cash_change = get_buy_cash_required(total_val, fee_value, fee_type)
+
+    session.delete(lot)
+    session.delete(trade)
+
+    if cash_change > 0:
+        wallet_txn = WalletTransaction(
+            portfolio_id=portfolio_id,
+            type="DEPOSIT",
+            amount=abs(cash_change),
+            timestamp=datetime.utcnow(),
+        )
+        session.add(wallet_txn)
+
+    session.commit()
+
+    return {
+        "status": "success",
+        "trade_id": trade_id,
+        "cash_refund": cash_change,
+    }
+
 @app.get("/api/trades", response_model=List[Trade])
 def get_trades(portfolio_id: int, session: Session = Depends(get_session)):
     get_portfolio_or_404(session, portfolio_id)
     trades = session.exec(select(Trade).where(Trade.portfolio_id == portfolio_id).order_by(Trade.timestamp.desc())).all()
     return trades
+
+@app.get("/api/portfolio/{portfolio_id}/history")
+def get_portfolio_history(portfolio_id: int, session: Session = Depends(get_session)):
+    get_portfolio_or_404(session, portfolio_id)
+
+    open_lots = session.exec(
+        select(TaxLot)
+        .join(Trade)
+        .where(Trade.portfolio_id == portfolio_id)
+        .where(TaxLot.remaining_qty > 0)
+        .order_by(TaxLot.timestamp.desc())
+    ).all()
+
+    closures = session.exec(
+        select(LotClosure)
+        .join(TaxLot)
+        .join(Trade)
+        .where(Trade.portfolio_id == portfolio_id)
+        .order_by(LotClosure.timestamp.desc())
+    ).all()
+
+    response = []
+    for lot in open_lots:
+        buy_trade = lot.trade
+        if not buy_trade:
+            continue
+
+        cost_basis = float(lot.cost_basis or 0.0)
+        units = float(lot.remaining_qty or 0.0)
+        invested = cost_basis * units
+        fee_value = get_fee_value(
+            buy_trade.price or 0.0,
+            buy_trade.quantity or 0.0,
+            buy_trade.fee or 0.0,
+            normalize_fee_type(buy_trade.fee_type)
+        )
+        if float(lot.original_qty or 0.0) > 0:
+            fee_value = fee_value * (units / float(lot.original_qty))
+
+        response.append({
+            "id": f"open-{lot.id}",
+            "coin_id": buy_trade.coin_id,
+            "symbol": buy_trade.symbol,
+            "action_type": "BUY",
+            "invested": invested,
+            "units": units,
+            "open_price": float(buy_trade.price or 0.0),
+            "open_time": lot.timestamp,
+            "close_price": None,
+            "close_time": None,
+            "realized_pnl": None,
+            "pnl_percent": None,
+            "target_lot_id": None,
+            "row_type": "OPEN",
+            "fee_value": fee_value,
+        })
+
+    for closure in closures:
+        buy_trade = closure.tax_lot.trade if closure.tax_lot else None
+        sell_trade = closure.sell_trade
+        if not buy_trade or not sell_trade:
+            continue
+
+        cost_basis = float(closure.tax_lot.cost_basis or 0.0)
+        units = float(closure.quantity or 0.0)
+        invested = cost_basis * units
+        realized_pnl = float(closure.realized_pnl or 0.0)
+        pnl_percent = (realized_pnl / invested * 100) if invested > 0 else 0.0
+        fee_value = get_fee_value(
+            buy_trade.price or 0.0,
+            buy_trade.quantity or 0.0,
+            buy_trade.fee or 0.0,
+            normalize_fee_type(buy_trade.fee_type)
+        )
+        if float(closure.tax_lot.original_qty or 0.0) > 0:
+            fee_value = fee_value * (units / float(closure.tax_lot.original_qty))
+
+        response.append({
+            "id": closure.id,
+            "coin_id": buy_trade.coin_id,
+            "symbol": buy_trade.symbol,
+            "action_type": "SELL",
+            "invested": invested,
+            "units": units,
+            "open_price": float(buy_trade.price or 0.0),
+            "open_time": buy_trade.timestamp,
+            "close_price": float(sell_trade.price or 0.0),
+            "close_time": sell_trade.timestamp,
+            "realized_pnl": realized_pnl,
+            "pnl_percent": pnl_percent,
+            "target_lot_id": sell_trade.target_lot_id,
+            "row_type": "CLOSED",
+            "fee_value": fee_value,
+        })
+
+    return response
 
 @app.get("/api/portfolio/{portfolio_id}/positions/{coin_id}")
 def get_position_detail(portfolio_id: int, coin_id: str, session: Session = Depends(get_session)):
@@ -469,6 +615,7 @@ def get_position_lots(portfolio_id: int, coin_id: str, session: Session = Depend
             "symbol": lot.trade.symbol,
             "purchase_price": lot.trade.price,
             "original_qty": lot.original_qty,
+            "trade_quantity": lot.trade.quantity,
             "remaining_qty": lot.remaining_qty,
             "cost_basis": get_buy_cost_basis_per_unit(lot.trade.price, lot.trade.quantity, net_qty, fee_type),
             "fee": lot.trade.fee,

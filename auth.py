@@ -42,7 +42,6 @@ async def get_current_user(authorization: str = Header(None)) -> str:
     Returns the Clerk user ID (sub claim).
     """
     # logging token presence helps troubleshoot production issues
-    print("Authorization header received:", authorization)
     if authorization is None or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     

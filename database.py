@@ -16,6 +16,7 @@ TURSO_URL = os.getenv("TURSO_DATABASE_URL")
 
 if TURSO_URL:
     import libsql
+    import sqlite3
 
     # SQLAlchemy expects a DB‑API connection that behaves like the standard
     # sqlite3 module.  The libsql client lacks a couple of methods so we
@@ -33,8 +34,13 @@ if TURSO_URL:
 
     def _turso_creator():
         auth = os.getenv("TURSO_AUTH_TOKEN", "")
-        raw_conn = libsql.connect(TURSO_URL, auth_token=auth)
-        return _SQLiteShim(raw_conn)
+        try:
+            raw_conn = libsql.connect(TURSO_URL, auth_token=auth)
+            return _SQLiteShim(raw_conn)
+        except Exception:
+            # Fallback to local SQLite if Turso is unreachable.
+            sqlite_file_name = "database.db"
+            return sqlite3.connect(sqlite_file_name)
 
     engine = create_engine("sqlite://", echo=False, creator=_turso_creator)
 else:
