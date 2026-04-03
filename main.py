@@ -8,10 +8,10 @@ import requests
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env.local")
 from sqlmodel import Session, select
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, cast
 from datetime import datetime
 from database import create_db_and_tables, get_session
-from models import User, Portfolio, Trade, TaxLot, WalletTransaction, TradeType, LotClosure
+from models import User, Portfolio, Trade, TaxLot, WalletTransaction, TradeType, FeeType, LotClosure
 from services.lot_manager import LotManager
 from services.calculator import Calculator
 from coingecko_client import CoinGeckoClient
@@ -36,16 +36,23 @@ _fx_cache: Dict[str, Any] = {
 # origins are useful; in production we also need to allow the deployed
 # frontend.  To make this future-proof we read a comma-separated list from
 # the ALLOWED_ORIGINS env var.
+def _normalize_origin(value: str) -> str:
+    return value.strip().rstrip("/")
+
+
 origins = [
     "http://localhost:3000",
     "http://localhost:3001",
     "http://127.0.0.1:3000",
     "http://192.168.1.2:3000",
     "https://multicryptoportfolio.vercel.app",
+    "https://assets.vznery.com",
 ]
 extra = os.getenv("ALLOWED_ORIGINS")
 if extra:
-    origins.extend([o.strip() for o in extra.split(",") if o.strip()])
+    origins.extend([_normalize_origin(o) for o in extra.split(",") if o.strip()])
+
+origins = list(dict.fromkeys(_normalize_origin(o) for o in origins if o.strip()))
 
 app.add_middleware(
     CORSMiddleware,
@@ -132,6 +139,10 @@ def create_portfolio(name: str, user_id: str = Depends(get_current_user), sessio
         user = User(clerk_id=user_id, email="test@example.com")
         session.add(user)
         session.commit()
+        session.refresh(user)
+
+    if user.id is None:
+        raise HTTPException(status_code=500, detail="Failed to resolve user id")
     
     portfolio = Portfolio(name=name, user_id=user.id)
     session.add(portfolio)
@@ -282,11 +293,11 @@ def add_trade(portfolio_id: int, coin_id: str, symbol: str, type: str, price: fl
         target_lot_id=target_lot_id,
         coin_id=coin_id,
         symbol=symbol,
-        type=trade_type, # BUY/SELL
+        type=TradeType(trade_type), # BUY/SELL
         price=price,
         quantity=quantity,
         fee=stored_fee,
-        fee_type=normalized_fee_type
+        fee_type=FeeType(normalized_fee_type)
     )
     session.add(trade)
     session.commit()
@@ -392,7 +403,7 @@ def update_buy_trade(
     trade.price = price
     trade.quantity = quantity
     trade.fee = fee
-    trade.fee_type = normalized_fee_type
+    trade.fee_type = FeeType(normalized_fee_type)
 
     net_quantity = get_buy_net_quantity(quantity, fee, normalized_fee_type)
     if net_quantity <= 0:
@@ -484,7 +495,11 @@ def delete_buy_trade(
 @app.get("/api/trades", response_model=List[Trade])
 def get_trades(portfolio_id: int, session: Session = Depends(get_session)):
     get_portfolio_or_404(session, portfolio_id)
-    trades = session.exec(select(Trade).where(Trade.portfolio_id == portfolio_id).order_by(Trade.timestamp.desc())).all()
+    trades = session.exec(
+        select(Trade)
+        .where(Trade.portfolio_id == portfolio_id)
+        .order_by(cast(Any, Trade.timestamp).desc())
+    ).all()
     return trades
 
 @app.get("/api/portfolio/{portfolio_id}/history")
@@ -496,7 +511,7 @@ def get_portfolio_history(portfolio_id: int, session: Session = Depends(get_sess
         .join(Trade)
         .where(Trade.portfolio_id == portfolio_id)
         .where(TaxLot.remaining_qty > 0)
-        .order_by(TaxLot.timestamp.desc())
+        .order_by(cast(Any, TaxLot.timestamp).desc())
     ).all()
 
     closures = session.exec(
@@ -504,7 +519,7 @@ def get_portfolio_history(portfolio_id: int, session: Session = Depends(get_sess
         .join(TaxLot)
         .join(Trade)
         .where(Trade.portfolio_id == portfolio_id)
-        .order_by(LotClosure.timestamp.desc())
+        .order_by(cast(Any, LotClosure.timestamp).desc())
     ).all()
 
     response = []
@@ -600,7 +615,7 @@ def get_position_lots(portfolio_id: int, coin_id: str, session: Session = Depend
         .where(Trade.portfolio_id == portfolio_id)
         .where(Trade.coin_id == coin_id)
         .where(TaxLot.remaining_qty > 0)
-        .order_by(TaxLot.timestamp.asc())
+        .order_by(cast(Any, TaxLot.timestamp).asc())
     )
     lots = session.exec(statement).all()
     
